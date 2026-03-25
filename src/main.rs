@@ -85,6 +85,13 @@ const HELD_KARP_MIN_LAMBDA: f64 = 0.25;
 const HELD_KARP_INF: i64 = i64::MAX / 8;
 
 
+/// Max BCcarver iterations in the iterative optimality-proving phase.
+const ITERATIVE_BC_ITERS: usize = 10;
+
+/// Per-iteration BCcarver timeout (seconds) in the iterative phase.
+const ITERATIVE_BC_TIMEOUT: f64 = 8.0;
+
+
 // ───────────────────────────── DISTANCE MATRIX ─────────────────────────────
 
 
@@ -915,7 +922,147 @@ fn two_opt(dist: &DistMatrix, tour: &mut Vec<usize>) -> u64 {
 }
 
 
-/// Build best initial upper bound: run NN from multiple starts + 2-Opt.
+/// Or-opt: try relocating chains of 1, 2, or 3 consecutive cities to better
+/// positions in the tour. Significantly stronger than 2-opt. Returns new cost.
+///
+/// "Remove expensive subcycles, keep vertices": edges forming costly detours are
+/// re-routed; vertices remain reachable via cheaper reconnections.
+fn or_opt(dist: &DistMatrix, tour: &mut Vec<usize>) -> u64 {
+    let n = tour.len();
+    if n < 5 {
+        return tour_cost(dist, tour);
+    }
+    // Pin city 0 at index 0 to avoid circular-wrap complexity
+    if tour[0] != 0 {
+        if let Some(p) = tour.iter().position(|&x| x == 0) {
+            tour.rotate_left(p);
+        }
+    }
+    let mut cost = tour_cost(dist, tour);
+    let mut any_improved = true;
+    while any_improved {
+        any_improved = false;
+        for seg_len in 1usize..=3 {
+            if n <= seg_len + 1 {
+                continue;
+            }
+            'seg: for start in 1..=(n - seg_len) {
+                let end = start + seg_len - 1;
+                let prev = start - 1; // always >= 0 since start >= 1
+                let next = if end + 1 < n { end + 1 } else { 0 };
+
+                let a = tour[prev];
+                let x = tour[start];      // segment first city
+                let y = tour[end];        // segment last city
+                let b = tour[next];
+
+                if a == b {
+                    continue;
+                }
+                let cab = dist.get(a, b);
+                let cax = dist.get(a, x);
+                let cyb = dist.get(y, b);
+                if cab == u32::MAX || cax == u32::MAX || cyb == u32::MAX {
+                    continue;
+                }
+                // Savings from removing segment out of its current slot
+                let removal_saving = cax as i64 + cyb as i64 - cab as i64;
+
+                let mut best_gain = 0i64;
+                let mut best_j = n; // sentinel: no improvement found
+                let mut best_rev = false;
+
+                for j in 0..n {
+                    // Skip the segment itself and its immediate predecessor
+                    if j >= prev && j <= end {
+                        continue;
+                    }
+                    let jnext = if j + 1 < n { j + 1 } else { 0 };
+                    // Skip if jnext falls inside the segment
+                    if jnext >= start && jnext <= end {
+                        continue;
+                    }
+                    let c = tour[j];
+                    let d = tour[jnext];
+                    let ccd = dist.get(c, d);
+                    if ccd == u32::MAX {
+                        continue;
+                    }
+                    // Forward: c → x … y → d
+                    let ccx = dist.get(c, x);
+                    let cyd = dist.get(y, d);
+                    if ccx != u32::MAX && cyd != u32::MAX {
+                        let gain = removal_saving - (ccx as i64 + cyd as i64 - ccd as i64);
+                        if gain > best_gain {
+                            best_gain = gain;
+                            best_j = j;
+                            best_rev = false;
+                        }
+                    }
+                    // Reversed: c → y … x → d  (only for seg_len ≥ 2)
+                    if seg_len >= 2 {
+                        let ccy = dist.get(c, y);
+                        let cxd = dist.get(x, d);
+                        if ccy != u32::MAX && cxd != u32::MAX {
+                            let gain = removal_saving - (ccy as i64 + cxd as i64 - ccd as i64);
+                            if gain > best_gain {
+                                best_gain = gain;
+                                best_j = j;
+                                best_rev = true;
+                            }
+                        }
+                    }
+                }
+
+                if best_j < n {
+                    let mut seg: Vec<usize> = tour[start..=end].to_vec();
+                    if best_rev {
+                        seg.reverse();
+                    }
+                    // Build tour without the segment
+                    let mut rest = Vec::with_capacity(n - seg_len);
+                    rest.extend_from_slice(&tour[..start]);
+                    if end + 1 < n {
+                        rest.extend_from_slice(&tour[end + 1..]);
+                    }
+                    // Adjust insertion index for the removed elements
+                    let adj_j = if best_j < start { best_j } else { best_j - seg_len };
+                    let mut new_tour = Vec::with_capacity(n);
+                    new_tour.extend_from_slice(&rest[..=adj_j]);
+                    new_tour.extend_from_slice(&seg);
+                    if adj_j + 1 < rest.len() {
+                        new_tour.extend_from_slice(&rest[adj_j + 1..]);
+                    }
+                    debug_assert_eq!(new_tour.len(), n);
+                    cost = (cost as i64 - best_gain) as u64;
+                    *tour = new_tour;
+                    any_improved = true;
+                    continue 'seg;
+                }
+            }
+        }
+    }
+    cost
+}
+
+
+/// Lin-Kernighan style improvement: alternates 2-opt and Or-opt until
+/// neither makes further progress.  Much stronger than 2-opt alone.
+fn lk_improve(dist: &DistMatrix, tour: &mut Vec<usize>) -> u64 {
+    let mut cost = two_opt(dist, tour);
+    loop {
+        let prev = cost;
+        or_opt(dist, tour);          // modifies tour in-place
+        cost = two_opt(dist, tour);  // recomputes cost after or-opt reshaping
+        if cost >= prev {
+            break;
+        }
+    }
+    cost
+}
+
+
+/// Build best initial upper bound: run NN from multiple starts + LK.
 
 fn build_upper_bound(dist: &DistMatrix) -> (u64, Vec<usize>) {
 
@@ -951,7 +1098,7 @@ fn build_upper_bound(dist: &DistMatrix) -> (u64, Vec<usize>) {
 
         }
 
-        let c = two_opt(dist, &mut tour);
+        let c = lk_improve(dist, &mut tour);
 
         if c < best_cost {
 
@@ -1904,6 +2051,54 @@ fn enumerate_subtasks(dist: &DistMatrix, start: usize, depth: usize) -> Vec<SubT
 }
 
 
+/// Return a copy of `base` with every edge belonging to `tour` removed.
+/// Forces BCcarver to find a Hamiltonian cycle *different* from `tour`.
+/// If BCcarver returns UNSAT, `tour` is the unique HC in the pruned graph
+/// ⟹ proven globally optimal.
+fn build_graph_for_bccarver(base: &[Vec<usize>], tour: &[usize]) -> Vec<Vec<usize>> {
+
+    let n = tour.len();
+
+    // O(n²) adjacency matrix for tour edges — fast lookup, fine for TSP sizes
+    let mut is_tour = vec![vec![false; n]; n];
+
+    for i in 0..n {
+
+        let u = tour[i];
+
+        let v = tour[(i + 1) % n];
+
+        if u < n && v < n {
+
+            is_tour[u][v] = true;
+
+            is_tour[v][u] = true;
+
+        }
+
+    }
+
+    base.iter()
+
+        .enumerate()
+
+        .map(|(u, adj)| {
+
+            adj.iter()
+
+                .copied()
+
+                .filter(|&v| v < n && !is_tour[u][v])
+
+                .collect()
+
+        })
+
+        .collect()
+
+}
+
+
 fn masked_dist_from_domain(dist: &DistMatrix, domain: &[Vec<usize>]) -> DistMatrix {
 
     let n = dist.n;
@@ -2009,14 +2204,73 @@ impl TspSolver {
 
         let shared_ub = Arc::new(SharedUB::new(ub_cost, ub_tour));
 
+        let base_graph = build_complete_graph(n);
+
+        // ── Iterative BCcarver optimality-proving loop ────────────────────────────
+        // Each iteration:
+        //  1. Prune edges whose 1-tree lower-bound ≥ current UB.
+        //     ("Remove expensive subcycles/paths, keep their vertices" — only the
+        //      edges that can't improve on the current best are deleted.)
+        //  2. Remove the current-best-tour's own edges so BCcarver must find a
+        //     *different* Hamiltonian cycle.
+        //  3. BCcarver on the remaining graph:
+        //       UNSAT   → current tour is the *unique* HC in the pruned graph
+        //                 → proven globally optimal, return immediately.
+        //       SAT     → found another HC; apply LK to it; if cheaper, tighten UB
+        //                 and loop again with the stricter bound.
+        //       TIMEOUT → fall through to full B&B.
+        {
+            let mut proven_optimal = false;
+            for _iter in 0..ITERATIVE_BC_ITERS {
+                let cur_cost = shared_ub.get();
+                let cur_tour = shared_ub.tour.lock().unwrap().clone();
+
+                // Prune: keep only edges that could appear in a tour < cur_cost
+                let pruned = match prune_edges_by_cost(&self.dist, &base_graph, cur_cost) {
+                    Some(g) => g,
+                    None => { proven_optimal = true; break; }
+                };
+
+                // Force BCcarver to find something different
+                let search_graph = build_graph_for_bccarver(&pruned, &cur_tour);
+
+                // Fast structural UNSAT (propagation only, no branching)
+                let preprocessed = match bccarver::preprocess_graph(&search_graph) {
+                    Some(g) => g,
+                    None => { proven_optimal = true; break; }
+                };
+
+                match bccarver::solve_graph_parallel(&preprocessed, ITERATIVE_BC_TIMEOUT) {
+                    bccarver::SolveResult::Unsat => {
+                        proven_optimal = true;
+                        break;
+                    }
+                    bccarver::SolveResult::Timeout => break,
+                    bccarver::SolveResult::Sat(edges) => {
+                        if let Some(mut order) = bccarver::cycle_order_from_edges(n, &edges) {
+                            let new_cost = lk_improve(&self.dist, &mut order);
+                            shared_ub.try_update(new_cost, &order);
+                        }
+                        // Next iteration re-prunes with the (possibly tighter) UB
+                    }
+                }
+            }
+            if proven_optimal {
+                return TspResult {
+                    cost: shared_ub.get(),
+                    tour: shared_ub.tour.lock().unwrap().clone(),
+                    elapsed: t0.elapsed().as_secs_f64(),
+                    upper_bound_initial: ub_initial,
+                };
+            }
+        }
+        // ──────────────────────────────────────────────────────────────────────────
 
         // Step 2: prune by a safe cycle lower bound, then run BCcarver's
 
         // structural preprocessing on the reduced domain.
 
-        let base_graph = build_complete_graph(n);
-
-        let cost_pruned_graph = match prune_edges_by_cost(&self.dist, &base_graph, ub_cost) {
+        let cost_pruned_graph = match prune_edges_by_cost(&self.dist, &base_graph, shared_ub.get()) {
 
             Some(graph) => graph,
 
@@ -2024,7 +2278,7 @@ impl TspSolver {
 
                 return TspResult {
 
-                    cost: ub_cost,
+                    cost: shared_ub.get(),
 
                     tour: shared_ub.tour.lock().unwrap().clone(),
 
@@ -2046,7 +2300,7 @@ impl TspSolver {
 
                 return TspResult {
 
-                    cost: ub_cost,
+                    cost: shared_ub.get(),
 
                     tour: shared_ub.tour.lock().unwrap().clone(),
 

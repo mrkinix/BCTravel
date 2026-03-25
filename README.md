@@ -1,31 +1,55 @@
 # BCTravel: Exact TSP Solver
 **By Hédi Ben Chiboub**
 
-BCTravel is a high-performance, exact Branch-and-Bound solver for the Symmetric Traveling Salesman Problem (TSP). It operates by combining a Held-Karp 1-Tree Lagrangian relaxation for sharp lower bounds with custom topological pruning driven by the **BCcarver** Hamiltonian cycle engine.
+Exact TSP up to ~75 nodes in ~90s using Held-Karp bounds and custom pruning (BCcarver).
 
-Built in Rust, the solver is aggressively optimized for zero-heap inner loops, cache-friendly data structures, and highly parallelized tree exploration.
+BCTravel is a high-performance exact solver for the Symmetric Traveling Salesman Problem (TSP), built on Branch-and-Bound with strong lower bounds and aggressive structural pruning.
+
+It combines Held-Karp 1-tree Lagrangian relaxation with a custom pruning engine (**BCcarver**) and an iterative optimality loop that can prove optimality *without full search*.
+
+Implemented in Rust with focus on low-level efficiency: zero-heap inner loops, cache-friendly data structures, and parallel tree exploration.
 
 ---
 
 ## ⚙️ Architecture & Engine
 
-The solver achieves exact optimality through a synthesis of heuristics, graph theory, and parallel computing:
+BCTravel achieves exact optimality through a layered approach:
 
-* **Held-Karp 1-Tree Lower Bound**: Utilizes a fixed-iteration Lagrangian relaxation. Computes Minimum Spanning Trees (MST) with penalty adjustments to enforce degree constraints, providing sharp lower bounds to prune the DFS tree early.
-* **BCcarver Topological Pruning**: Before branching begins, the graph is structurally preprocessed using the Ben-Chiboub Carver logic. Edges that cannot belong to an optimal tour are permanently pruned from the domain, massively reducing the state space.
-* **Heuristic Upper Bounding**: Establishes a strict initial ceiling using a multi-start Nearest-Neighbor heuristic followed by aggressive 2-Opt local search optimizations.
-* **Statistical Branch Ordering**: Prioritizes edge traversal using a `μ + 2σ` statistical threshold. Costly/unlikely edges are evaluated last (for ordering only, not unsafe pruning).
-* **Adaptive Bitmasking**: State tracking utilizes a highly optimized `u128` fast-path for instances where `N <= 128`. Automatically falls back to a dynamic `Vec<u64>` mask for larger graphs without sacrificing exactness.
-* **Rayon Parallel Splitting**: Deploys independent subtasks across a thread pool by enumerating early branch decisions to a configurable depth (`SPLIT_DEPTH`), maximizing multi-core throughput.
+- **Held-Karp 1-Tree Lower Bound**  
+  Fixed-iteration Lagrangian relaxation using MST with penalties to enforce degree constraints. Provides tight lower bounds for pruning.
+
+- **BCcarver Topological Pruning**  
+  Preprocessing phase that removes edges incompatible with any optimal Hamiltonian cycle, reducing branching factor before search.
+
+- **Iterative Optimality Loop (NEW)**  
+  Before full Branch-and-Bound, the solver attempts to prove optimality early:
+  - Prunes edges where `LB ≥ UB`
+  - Removes edges of the current best tour
+  - Runs BCcarver to search for alternative Hamiltonian cycles  
+    - **UNSAT** → no alternative tour exists → current solution is globally optimal  
+    - **SAT** → new tour found → improved via local search → UB tightened  
+    - **TIMEOUT** → fallback to B&B with improved UB  
+  - Repeats for a fixed number of iterations
+
+  This loop can eliminate the need for full search on structured instances.
+
+- **Heuristic Upper Bound (UB)**  
+  Multi-start Nearest Neighbor followed by 2-Opt refinement.
+
+- **Branch Ordering Heuristics**  
+  Uses a `μ + 2σ` cost-based ordering to prioritize promising edges.
+
+- **Adaptive Bitmasking**  
+  Fast `u128` path for `N ≤ 128`, fallback to dynamic bitsets for larger graphs.
+
+- **Parallel Branching (Rayon)**  
+  Early tree splitting across threads for efficient multi-core scaling.
 
 ---
 
-## 🚀 Usage & Protocol
+## 🚀 Usage
 
-Run the solver directly via Cargo. The CLI supports built-in test suites, custom TSPLIB parsing, and random instance generation.
-
-### Built-in Test Suite & Benchmarks
-Run the default suite (verifies small known instances and benchmarks random Euclidean graphs):
+### Default benchmarks
 ```bash
 cargo run --release
 ```
@@ -66,10 +90,11 @@ Practical limits depend heavily on the graph structure. The solver guarantees ex
 * **Random Metric / Euclidean TSP**: Exact up to N≈100–200.
 
 ### Reference Benchmarks (8-Core CPU)
-| N | NN + 2-Opt UB | B&B Optimal | Time (s) | Status |
-|---|---|---|---|---|
-| 20 | 2384 | 2384 | 0.0649 | ✅ |
-| 30 | 2480 | 2473 | 0.3948 | ✅ |
-| 40 | 2587 | 2559 | 2.4217 | ✅ |
-| 50 | 2922 | 2882 | 11.9314 | ✅ |
-| 75 | 3347 | 3317 | 107.3725 | ✅ |
+| N | NN + 2-Opt UB | B&B Optimal | Time (s) | Gap | Status |
+|---|---|---|---|---|---|
+| 20 | 2384 | 2384 | 0.0607 | 0.0% | ✅ |
+| 30 | 2473 | 2473 | 0.3014 | 0.0% | ✅ |
+| 40 | 2587 | 2559 | 1.8621 | 1.1% | ✅ |
+| 41 | 2462 | 2462 | 2.0212 | 0.0% | ✅ |
+| 50 | 2916 | 2882 | 9.7106 | 1.2% | ✅ |
+| 75 | 3317 | 3317 | 94.1843 | 0.0% | ✅ |
