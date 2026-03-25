@@ -1,0 +1,17 @@
+[package]
+name = "bctravel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bctravel"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
